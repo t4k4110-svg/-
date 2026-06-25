@@ -1,0 +1,6 @@
+# メルカリ割安商品検出ツール — 必要ライブラリ
+# インストール方法: pip install -r requirements.txt
+#
+# ※ tkinter と winsound は Python に標準搭載されているため不要
+
+playwright==1.44.0
