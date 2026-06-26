@@ -264,7 +264,8 @@ class BargainDetectorApp:
         # ── ④ 割安判定 ─────────────────────────────────────────────────
         ratio = price / market_price
         self._log(
-            f"  相場: ¥{market_price:,}（{samples}件） / 比率: {ratio:.0%}", "info"
+            f"  相場: ¥{market_price:,}（売切＋在庫 計{samples}件） / 比率: {ratio:.0%}",
+            "info",
         )
 
         if ratio <= PRICE_RATIO_THRESHOLD:

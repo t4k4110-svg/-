@@ -163,46 +163,69 @@ class MercariMonitor:
         }
 
     # ------------------------------------------------------------------ #
-    #  相場価格取得（売り切れ商品の中央値を使用）
-    # ※ image_searchで特定した商品名で検索することで精度向上
-    # ------------------------------------------------------------------ #
+    #  相場価格取得
+    #  「売り切れ」と「在庫あり」の両方を検索して加重平均で相場を算出する。
+    #  検索キーワード例: "パタゴニア Retro-X Fleece Jacket"
+    #  ------------------------------------------------------------------ #
 
     def get_market_price(self, product_name: str, keyword: str) -> tuple[int | None, int]:
         """
-        商品名でメルカリの「売り切れ」商品を検索し、価格の平均値を相場とする。
-        product_name: 画像検索で特定した商品名（なければタイトル）
-        Returns: (相場価格 or None, サンプル数)
+        画像検索で特定した商品名で、売り切れ＋在庫あり両方の価格を収集し
+        加重平均で相場を算出する。
+        - 売り切れ価格（実際の成約価格）: 重み 70%
+        - 在庫あり価格（現在の出品価格）: 重み 30%
+        Returns: (相場価格 or None, 総サンプル数)
         """
         search_term = _build_search_query(keyword, product_name)
+
+        # ── ① 売り切れ検索（実際に成約した値段 → 信頼度高）──
+        sold_prices = self._fetch_prices(search_term, status="sold_out", limit=25)
+
+        # ── ② 在庫あり検索（現在の出品価格 → 参考値）──
+        active_prices = self._fetch_prices(search_term, status="on_sale", limit=15)
+
+        total_samples = len(sold_prices) + len(active_prices)
+        logger.info(
+            f"相場サンプル: 売り切れ {len(sold_prices)}件 / "
+            f"在庫あり {len(active_prices)}件"
+        )
+
+        if total_samples < MIN_MARKET_PRICE_SAMPLES:
+            return None, total_samples
+
+        # ── ③ 加重平均で相場を算出 ──
+        market_price = _weighted_market_price(sold_prices, active_prices)
+        return market_price, total_samples
+
+    def _fetch_prices(self, search_term: str, status: str, limit: int) -> list[int]:
+        """
+        指定ステータス（sold_out / on_sale）でメルカリ検索し、価格リストを返す。
+        相場調査専用ページ（self._market_page）を使用する。
+        """
         url = (
             f"{MERCARI_SEARCH_URL}"
             f"?keyword={search_term}"
-            f"&status=sold_out"
+            f"&status={status}"
             f"&sort=created_time"
             f"&order=desc"
         )
-        # 相場調査は専用ページで行う（メインページの状態を壊さない）
         self._safe_goto(self._market_page, url, wait=4000)
 
-        prices = []
         items = (
             self._market_page.query_selector_all('[data-testid="item-cell"]')
             or self._market_page.query_selector_all('li[data-component-name]')
+            or []
         )
 
-        for item in (items or [])[:30]:
+        prices = []
+        for item in items[:limit]:
             try:
                 price = _extract_price(item.inner_text())
                 if price and MIN_PRICE <= price <= MAX_PRICE:
                     prices.append(price)
             except Exception:
                 continue
-
-        if len(prices) < MIN_MARKET_PRICE_SAMPLES:
-            return None, len(prices)
-
-        market_price = _trimmed_mean(prices)
-        return market_price, len(prices)
+        return prices
 
     # ------------------------------------------------------------------ #
     #  内部ユーティリティ
@@ -279,3 +302,19 @@ def _trimmed_mean(prices: list[int]) -> int:
     trim = max(1, n // 10)
     trimmed = prices_sorted[trim: n - trim] if n - trim > trim else prices_sorted
     return int(sum(trimmed) / len(trimmed))
+
+
+def _weighted_market_price(sold_prices: list[int], active_prices: list[int]) -> int:
+    """
+    売り切れ価格（重み70%）と在庫あり価格（重み30%）を合わせた加重相場を返す。
+    どちらか一方しかない場合はそちらの平均を使う。
+    """
+    SOLD_WEIGHT   = 0.70  # 実際に売れた値段を重視
+    ACTIVE_WEIGHT = 0.30  # 出品中の価格は参考程度
+
+    sold_avg   = _trimmed_mean(sold_prices)   if sold_prices   else None
+    active_avg = _trimmed_mean(active_prices) if active_prices else None
+
+    if sold_avg and active_avg:
+        return int(sold_avg * SOLD_WEIGHT + active_avg * ACTIVE_WEIGHT)
+    return sold_avg or active_avg  # どちらか一方のみ存在する場合
