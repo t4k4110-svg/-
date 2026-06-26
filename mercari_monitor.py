@@ -5,7 +5,6 @@
 # ============================================================
 
 import re
-import time
 import logging
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from config import (
@@ -20,11 +19,12 @@ class MercariMonitor:
     """メルカリの商品監視クラス"""
 
     def __init__(self):
-        self.seen_ids: set[str] = set()   # 一度見た商品IDを記録（重複通知防止）
+        self.seen_ids: set[str] = set()
         self._pw = None
         self._browser = None
         self._context = None
-        self._page = None
+        self._page = None          # メイン検索ページ
+        self._market_page = None   # 相場調査専用ページ（並行処理用）
 
     # ------------------------------------------------------------------ #
     #  ライフサイクル
@@ -34,8 +34,8 @@ class MercariMonitor:
         """ブラウザを起動してメルカリのトップページを開く"""
         self._pw = sync_playwright().start()
         self._browser = self._pw.chromium.launch(
-            headless=False,          # ブラウザを画面に表示する
-            slow_mo=50,              # 操作の間隔を少し開けて人間らしく見せる
+            headless=False,
+            slow_mo=50,
             args=["--lang=ja-JP"],
         )
         self._context = self._browser.new_context(
@@ -47,10 +47,12 @@ class MercariMonitor:
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
         )
+        # ページを2つ用意：メイン検索用 + 相場調査用
         self._page = self._context.new_page()
-        # 最初にトップページへアクセスしてCookieを受け入れる
-        self._safe_goto("https://jp.mercari.com/", wait=3000)
-        logger.info("ブラウザ起動完了")
+        self._market_page = self._context.new_page()
+
+        self._safe_goto(self._page, "https://jp.mercari.com/", wait=3000)
+        logger.info("ブラウザ起動完了（ページ2枚）")
 
     def stop(self):
         """ブラウザを閉じる"""
@@ -61,6 +63,11 @@ class MercariMonitor:
                 self._pw.stop()
         except Exception:
             pass
+
+    @property
+    def context(self):
+        """image_searchモジュールにContextを渡すためのプロパティ"""
+        return self._context
 
     # ------------------------------------------------------------------ #
     #  新着商品取得
@@ -77,9 +84,9 @@ class MercariMonitor:
             f"&sort=created_time"
             f"&order=desc"
         )
-        self._safe_goto(url, wait=4000)
+        self._safe_goto(self._page, url, wait=4000)
 
-        all_listings = self._extract_listings()
+        all_listings = self._extract_listings(self._page)
         logger.info(f"[{keyword}] 取得件数: {len(all_listings)}")
 
         new_listings = []
@@ -90,11 +97,9 @@ class MercariMonitor:
 
         return new_listings
 
-    def _extract_listings(self) -> list[dict]:
+    def _extract_listings(self, page) -> list[dict]:
         """現在のページから商品情報を取り出す"""
         listings = []
-
-        # メルカリのセレクタは変わることがあるため複数試す
         selectors = [
             '[data-testid="item-cell"]',
             'li[data-component-name]',
@@ -105,13 +110,13 @@ class MercariMonitor:
 
         items = []
         for sel in selectors:
-            found = self._page.query_selector_all(sel)
+            found = page.query_selector_all(sel)
             if found:
                 items = found
                 break
 
         if not items:
-            logger.warning("商品リストのセレクタが見つかりませんでした。ページ構造が変わった可能性があります。")
+            logger.warning("商品リストのセレクタが見つかりませんでした")
             return listings
 
         for item in items:
@@ -125,25 +130,27 @@ class MercariMonitor:
         return listings
 
     def _parse_item_element(self, item) -> dict | None:
-        """1つの商品要素からID・タイトル・価格・URLを抽出"""
-        # --- URL / ID ---
+        """1つの商品要素からID・タイトル・価格・URL・画像URLを抽出"""
+        # URL / ID
         link = item.query_selector("a[href]")
         href = link.get_attribute("href") if link else ""
         m = re.search(r"m(\d+)", href or "")
         item_id = m.group(0) if m else ""
 
-        # --- 価格（¥記号付きの数字を正規表現で取得）---
+        # 価格
         raw_text = item.inner_text()
         price = _extract_price(raw_text)
         if price is None or not (MIN_PRICE <= price <= MAX_PRICE):
             return None
 
-        # --- タイトル（最長のテキストノードを採用）---
+        # タイトル（最長テキストを採用）
         title = _longest_text(item)
 
-        # --- 画像URL ---
+        # 画像URL（逆画像検索の入力に使う）
         img = item.query_selector("img")
         img_url = img.get_attribute("src") if img else ""
+        # サムネイルURLを元のサイズに変換（メルカリのURL規則）
+        img_url = _normalize_mercari_image_url(img_url)
 
         full_url = href if href.startswith("http") else f"https://jp.mercari.com{href}"
 
@@ -157,14 +164,16 @@ class MercariMonitor:
 
     # ------------------------------------------------------------------ #
     #  相場価格取得（売り切れ商品の中央値を使用）
+    # ※ image_searchで特定した商品名で検索することで精度向上
     # ------------------------------------------------------------------ #
 
-    def get_market_price(self, product_title: str, keyword: str) -> tuple[int | None, int]:
+    def get_market_price(self, product_name: str, keyword: str) -> tuple[int | None, int]:
         """
-        「売り切れ」商品を検索し、その価格の中央値を相場とする。
+        商品名でメルカリの「売り切れ」商品を検索し、価格の平均値を相場とする。
+        product_name: 画像検索で特定した商品名（なければタイトル）
         Returns: (相場価格 or None, サンプル数)
         """
-        search_term = _build_search_query(keyword, product_title)
+        search_term = _build_search_query(keyword, product_name)
         url = (
             f"{MERCARI_SEARCH_URL}"
             f"?keyword={search_term}"
@@ -172,13 +181,16 @@ class MercariMonitor:
             f"&sort=created_time"
             f"&order=desc"
         )
-        self._safe_goto(url, wait=4000)
+        # 相場調査は専用ページで行う（メインページの状態を壊さない）
+        self._safe_goto(self._market_page, url, wait=4000)
 
         prices = []
-        items_selector = self._page.query_selector_all('[data-testid="item-cell"]') or \
-                         self._page.query_selector_all('li[data-component-name]')
+        items = (
+            self._market_page.query_selector_all('[data-testid="item-cell"]')
+            or self._market_page.query_selector_all('li[data-component-name]')
+        )
 
-        for item in (items_selector or [])[:30]:
+        for item in (items or [])[:30]:
             try:
                 price = _extract_price(item.inner_text())
                 if price and MIN_PRICE <= price <= MAX_PRICE:
@@ -196,11 +208,11 @@ class MercariMonitor:
     #  内部ユーティリティ
     # ------------------------------------------------------------------ #
 
-    def _safe_goto(self, url: str, wait: int = 3000):
+    def _safe_goto(self, page, url: str, wait: int = 3000):
         """ページ遷移（タイムアウト・ネットワークエラーに対応）"""
         try:
-            self._page.goto(url, timeout=30_000, wait_until="domcontentloaded")
-            self._page.wait_for_timeout(wait)
+            page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+            page.wait_for_timeout(wait)
         except PlaywrightTimeout:
             logger.warning(f"タイムアウト: {url}")
         except Exception as e:
@@ -212,10 +224,8 @@ class MercariMonitor:
 # ------------------------------------------------------------------ #
 
 def _extract_price(text: str) -> int | None:
-    """テキストから ¥1,234 形式の価格を抽出して整数で返す"""
     m = re.search(r"¥\s*([\d,]+)", text or "")
     if not m:
-        # 円表記のみのケース
         m = re.search(r"([\d,]{3,})\s*円", text or "")
     if m:
         return int(m.group(1).replace(",", ""))
@@ -223,12 +233,10 @@ def _extract_price(text: str) -> int | None:
 
 
 def _longest_text(element) -> str:
-    """要素内のテキストノードのうち最長のものをタイトルと判断"""
     candidates = []
     for el in element.query_selector_all("p, span, div, h3"):
         try:
             t = el.inner_text().strip()
-            # 価格行や短すぎる行を除く
             if t and not re.search(r"^¥|^\d+円$", t) and len(t) > 3:
                 candidates.append(t)
         except Exception:
@@ -238,23 +246,34 @@ def _longest_text(element) -> str:
     return max(candidates, key=len)[:80]
 
 
-def _build_search_query(keyword: str, title: str) -> str:
-    """不要な単語を除いた検索クエリを組み立てる"""
+def _normalize_mercari_image_url(url: str) -> str:
+    """
+    メルカリのサムネイルURLを、より大きな画像のURLに変換する。
+    例: ...c!small.jpg → ...c!large.jpg
+    """
+    if not url:
+        return url
+    # サムネイル指定を大画面サイズに変更
+    url = re.sub(r"c!small", "c!large", url)
+    url = re.sub(r"w=\d+", "w=800", url)
+    url = re.sub(r"h=\d+", "h=800", url)
+    return url
+
+
+def _build_search_query(keyword: str, product_name: str) -> str:
     noise = [
         "新品", "未使用", "美品", "未着用", "タグ付き",
         "送料込", "送料無料", "即購入OK", "値下げ", "訳あり",
         "【", "】", "（", "）", "(", ")", "！", "!",
     ]
-    clean = title
+    clean = product_name
     for w in noise:
         clean = clean.replace(w, " ")
-    # 連続スペースを1つに圧縮し、先頭30文字を使用
     clean = re.sub(r"\s+", " ", clean).strip()[:30]
     return f"{keyword} {clean}".strip()
 
 
 def _trimmed_mean(prices: list[int]) -> int:
-    """外れ値を除いた平均値（上下10%を切り捨て）"""
     prices_sorted = sorted(prices)
     n = len(prices_sorted)
     trim = max(1, n // 10)
