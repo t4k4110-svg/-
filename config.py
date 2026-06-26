@@ -14,7 +14,7 @@ KEYWORDS = [
 PRICE_RATIO_THRESHOLD = 0.60
 
 # 何秒ごとにメルカリを再チェックするか
-CHECK_INTERVAL_SECONDS = 90
+CHECK_INTERVAL_SECONDS = 10
 
 # 対象とする価格帯（この範囲外は無視）
 MIN_PRICE = 1_000    # 1,000円未満は除外
